@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enterprise RAG</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
+    --border: #e2e2dc; --accent: #2f5bd3; --accent-soft: #e8eefc; --error: #b42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161614; --panel: #1f1f1d; --text: #ececea; --muted: #9a9a94;
+      --border: #33332f; --accent: #7c9cf5; --accent-soft: #252c40; --error: #f97066;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+  .layout { display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
+  aside { border-right: 1px solid var(--border); background: var(--panel); padding: 20px; overflow-y: auto; }
+  main { display: flex; flex-direction: column; min-width: 0; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+  .drop { border: 1.5px dashed var(--border); border-radius: 10px; padding: 18px; text-align: center; color: var(--muted); cursor: pointer; font-size: 14px; }
+  .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .docs { list-style: none; padding: 0; margin: 16px 0 0; }
+  .docs li { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .docs .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .docs .meta { color: var(--muted); font-size: 12px; }
+  .docs button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; }
+  .docs button:hover { color: var(--error); }
+  .status { font-size: 12px; margin-top: 10px; color: var(--muted); white-space: pre-line; }
+  #chat { flex: 1; overflow-y: auto; padding: 24px; }
+  .msg { max-width: 760px; margin: 0 auto 18px; }
+  .q { font-weight: 600; }
+  .a { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-top: 6px; white-space: pre-wrap; }
+  .a.err { color: var(--error); }
+  .tag { color: var(--accent); font-weight: 600; font-size: 12px; cursor: default; }
+  .sources { margin-top: 10px; font-size: 13px; }
+  .sources details { border-top: 1px solid var(--border); padding: 6px 0; }
+  .sources summary { cursor: pointer; }
+  .sources p { color: var(--muted); margin: 6px 0 0; white-space: pre-wrap; }
+  form { display: flex; gap: 8px; padding: 16px 24px; border-top: 1px solid var(--border); background: var(--panel); }
+  input[type=text] { flex: 1; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+  form button { padding: 10px 18px; border: none; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  form button:disabled { opacity: .5; cursor: default; }
+  .empty { color: var(--muted); text-align: center; margin-top: 15vh; }
+  @media (max-width: 720px) {
+    .layout { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; min-height: 100vh; }
+    aside { border-right: none; border-bottom: 1px solid var(--border); padding: 16px; }
+    #chat { padding: 16px; } form { padding: 12px 16px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <h1>Documents</h1>
+    <p class="sub">PDF, DOCX, TXT, MD, HTML</p>
+    <label class="drop" id="drop">
+      Drop files or click to upload
+      <input type="file" id="file" multiple hidden accept=".pdf,.docx,.txt,.md,.html,.htm">
+    </label>
+    <div class="status" id="status"></div>
+    <ul class="docs" id="docs"></ul>
+  </aside>
+  <main>
+    <div id="chat"><div class="empty" id="empty">Ask a question about your uploaded documents.</div></div>
+    <form id="ask">
+      <input type="text" id="question" placeholder="e.g. How many days of leave do new employees get?" autocomplete="off" required>
+      <button type="submit" id="send">Ask</button>
+    </form>
+  </main>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const label = (c) => c.page ? `${c.filename}, page ${c.page}` : c.filename;
+
+async function loadDocs() {
+  const res = await fetch("/api/documents");
+  const { documents } = await res.json();
+  $("docs").innerHTML = documents.map((d) => `
+    <li><div><div class="name" title="${esc(d.filename)}">${esc(d.filename)}</div>
+    <div class="meta">${d.chunks} chunks</div></div>
+    <button title="Delete" data-id="${d.doc_id}">×</button></li>`).join("");
+}
+
+$("docs").addEventListener("click", async (e) => {
+  const id = e.target.dataset.id;
+  if (!id || !confirm("Delete this document from the index?")) return;
+  await fetch(`/api/documents/${id}`, { method: "DELETE" });
+  loadDocs();
+});
+
+async function upload(files) {
+  if (!files.length) return;
+  $("status").textContent = `Indexing ${files.length} file(s)…`;
+  const body = new FormData();
+  for (const f of files) body.append("files", f);
+  try {
+    const res = await fetch("/api/documents", { method: "POST", body });
+    const { results } = await res.json();
+    $("status").textContent = results.map((r) =>
+      r.status === "indexed" ? `✓ ${r.filename} (${r.chunks} chunks)` :
+      r.status === "duplicate" ? `• ${r.filename} already indexed` :
+      `✗ ${r.filename}: ${r.detail}`).join("\n");
+  } catch (err) {
+    $("status").textContent = `Upload failed: ${err}`;
+  }
+  loadDocs();
+}
+
+$("file").addEventListener("change", (e) => { upload(e.target.files); e.target.value = ""; });
+const drop = $("drop");
+drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", (e) => { e.preventDefault(); drop.classList.remove("over"); upload(e.dataTransfer.files); });
+
+function renderAnswer(data) {
+  const byTag = Object.fromEntries(data.citations.map((c) => [c.tag, c]));
+  const html = esc(data.answer).replace(/\[(S\d+)\]/g, (m, tag) =>
+    byTag[tag] ? `<span class="tag" title="${esc(label(byTag[tag]))}">[${tag}]</span>` : "");
+  const sources = data.citations.map((c) => `
+    <details><summary><span class="tag">[${c.tag}]</span> ${esc(label(c))}</summary>
+    <p>${esc(c.snippet)}</p></details>`).join("");
+  return `<div class="a">${html}</div>${sources ? `<div class="sources">${sources}</div>` : ""}`;
+}
+
+$("ask").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const question = $("question").value.trim();
+  if (!question) return;
+  $("empty")?.remove();
+  const msg = document.createElement("div");
+  msg.className = "msg";
+  msg.innerHTML = `<div class="q">${esc(question)}</div><div class="a">Thinking…</div>`;
+  $("chat").appendChild(msg);
+  msg.scrollIntoView({ behavior: "smooth" });
+  $("question").value = "";
+  $("send").disabled = true;
+  try {
+    const res = await fetch("/api/ask", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    const data = await res.json();
+    msg.innerHTML = `<div class="q">${esc(question)}</div>` +
+      (res.ok ? renderAnswer(data) : `<div class="a err">${esc(data.detail || "Request failed")}</div>`);
+  } catch (err) {
+    msg.innerHTML = `<div class="q">${esc(question)}</div><div class="a err">${esc(String(err))}</div>`;
+  }
+  $("send").disabled = false;
+  $("question").focus();
+});
+
+loadDocs();
+</script>
+</body>
+</html>
