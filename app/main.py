@@ -1,10 +1,11 @@
 """FastAPI app: upload documents, list/delete them, and ask questions."""
 
+import json
 from functools import lru_cache
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -100,3 +101,32 @@ def ask(req: AskRequest):
         return get_pipeline().ask(req.question, req.top_k).to_dict()
     except LLMError as e:
         raise HTTPException(e.status, e.message)
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/api/ask/stream")
+def ask_stream(req: AskRequest):
+    """Same as /api/ask, streamed as Server-Sent Events: "sources", then
+    "token" events with raw text, then "done" with the validated answer. An LLM
+    failure after streaming has started arrives as an "error" event."""
+    try:
+        pipeline = get_pipeline()
+    except LLMError as e:
+        raise HTTPException(e.status, e.message)
+
+    def events():
+        try:
+            for event, data in pipeline.ask_stream(req.question, req.top_k):
+                yield _sse(event, data)
+        except LLMError as e:
+            yield _sse("error", {"status": e.status, "detail": e.message})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        # Stop proxies (e.g. nginx) and browsers from buffering the stream.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
