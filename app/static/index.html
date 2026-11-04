@@ -46,6 +46,12 @@
   form button { padding: 10px 18px; border: none; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
   form button:disabled { opacity: .5; cursor: default; }
   .empty { color: var(--muted); text-align: center; margin-top: 15vh; }
+  .a.pending { color: var(--muted); }
+  .a.streaming::after { content: "▍"; color: var(--accent); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .thinking { margin-top: 6px; font-size: 13px; color: var(--muted); }
+  .thinking summary { cursor: pointer; }
+  .thinking .trace { margin-top: 6px; padding: 8px 10px; border-left: 2px solid var(--border); max-height: 160px; overflow-y: auto; white-space: pre-wrap; }
   @media (max-width: 720px) {
     .layout { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; min-height: 100vh; }
     aside { border-right: none; border-bottom: 1px solid var(--border); padding: 16px; }
@@ -128,6 +134,116 @@ function renderAnswer(data) {
   return `<div class="a">${html}</div>${sources ? `<div class="sources">${sources}</div>` : ""}`;
 }
 
+// Parse a Server-Sent Events response body into {event, data} objects.
+async function* readEvents(res) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) !== -1) {
+      const raw = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      let event = "message", data = "";
+      for (const line of raw.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7);
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (data) yield { event, data: JSON.parse(data) };
+    }
+  }
+}
+
+const nearBottom = () => { const c = $("chat"); return c.scrollHeight - c.scrollTop - c.clientHeight < 80; };
+
+// Reveals text gradually so a fast burst from the model still reads as
+// streaming: each frame shows a slice of what's queued (bigger when more
+// is waiting), down to one character at a time.
+function typewriter(el, onTick) {
+  let shown = "", queue = "", timer = null, idle = null;
+  const tick = () => {
+    const n = document.hidden ? queue.length : Math.max(1, Math.ceil(queue.length / 30));
+    shown += queue.slice(0, n);
+    queue = queue.slice(n);
+    el.textContent = shown;
+    onTick();
+    if (queue) timer = setTimeout(tick, 16);
+    else { timer = null; idle?.(); idle = null; }
+  };
+  return {
+    push(text) { queue += text; if (!timer) timer = setTimeout(tick, 16); },
+    // Resolves once everything pushed so far is on screen.
+    drained: () => (queue || timer) ? new Promise((r) => { idle = r; }) : Promise.resolve(),
+  };
+}
+
+const thinkingHtml = (text, seconds) => text ? `
+  <details class="thinking"><summary>Thought for ${seconds}s</summary>
+  <div class="trace">${esc(text)}</div></details>` : "";
+
+async function askStreaming(question, msg, qHtml, showError) {
+  const res = await fetch("/api/ask/stream", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    return showError(data.detail || "Request failed");
+  }
+  const answerEl = msg.querySelector(".a");
+  const follow = () => { if (nearBottom()) $("chat").scrollTop = $("chat").scrollHeight; };
+  const writer = typewriter(answerEl, follow);
+  let thinkingText = "", thinkingEl = null, traceEl = null, thinkStart = 0, thinkSecs = 0;
+  let started = false, finished = false;
+
+  for await (const { event, data } of readEvents(res)) {
+    if (event === "sources") {
+      answerEl.textContent = data.retrieved.length ? "Reading the sources…" : "Searching…";
+    } else if (event === "thinking") {
+      if (!thinkingEl) {
+        thinkStart = performance.now();
+        answerEl.textContent = "Thinking…";
+        thinkingEl = document.createElement("details");
+        thinkingEl.className = "thinking";
+        thinkingEl.open = true;
+        thinkingEl.innerHTML = `<summary>Thinking…</summary><div class="trace"></div>`;
+        msg.insertBefore(thinkingEl, answerEl);
+        traceEl = thinkingEl.querySelector(".trace");
+      }
+      thinkingText += data.text;
+      traceEl.textContent = thinkingText;
+      traceEl.scrollTop = traceEl.scrollHeight;
+      follow();
+    } else if (event === "token") {
+      if (!started) {
+        started = true;
+        if (thinkingEl) {
+          thinkSecs = Math.max(1, Math.round((performance.now() - thinkStart) / 1000));
+          thinkingEl.open = false;
+          thinkingEl.querySelector("summary").textContent = `Thought for ${thinkSecs}s`;
+        }
+        answerEl.textContent = "";
+        answerEl.classList.remove("pending");
+        answerEl.classList.add("streaming");
+      }
+      writer.push(data.text);  // raw text; citations render on "done"
+    } else if (event === "done") {
+      if (thinkingEl && !thinkSecs) thinkSecs = Math.max(1, Math.round((performance.now() - thinkStart) / 1000));
+      await writer.drained();
+      // Replace the raw stream with the validated answer and its citations.
+      msg.innerHTML = qHtml + thinkingHtml(thinkingText, thinkSecs) + renderAnswer(data);
+      finished = true;
+    } else if (event === "error") {
+      showError(data.detail || "Request failed");
+      finished = true;
+    }
+  }
+  if (!finished) showError("The response was cut off before it finished.");
+}
+
 $("ask").addEventListener("submit", async (e) => {
   e.preventDefault();
   const question = $("question").value.trim();
@@ -135,21 +251,17 @@ $("ask").addEventListener("submit", async (e) => {
   $("empty")?.remove();
   const msg = document.createElement("div");
   msg.className = "msg";
-  msg.innerHTML = `<div class="q">${esc(question)}</div><div class="a">Thinking…</div>`;
+  const qHtml = `<div class="q">${esc(question)}</div>`;
+  const showError = (text) => { msg.innerHTML = qHtml + `<div class="a err">${esc(text)}</div>`; };
+  msg.innerHTML = qHtml + `<div class="a pending">Searching…</div>`;
   $("chat").appendChild(msg);
   msg.scrollIntoView({ behavior: "smooth" });
   $("question").value = "";
   $("send").disabled = true;
   try {
-    const res = await fetch("/api/ask", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
-    });
-    const data = await res.json();
-    msg.innerHTML = `<div class="q">${esc(question)}</div>` +
-      (res.ok ? renderAnswer(data) : `<div class="a err">${esc(data.detail || "Request failed")}</div>`);
+    await askStreaming(question, msg, qHtml, showError);
   } catch (err) {
-    msg.innerHTML = `<div class="q">${esc(question)}</div><div class="a err">${esc(String(err))}</div>`;
+    showError(String(err));
   }
   $("send").disabled = false;
   $("question").focus();

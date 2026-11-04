@@ -2,10 +2,11 @@
 then validate and attach citations."""
 
 import re
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 
 from .config import settings
-from .llm import LLM
+from .llm import LLM, Completion, Thinking
 from .store import Hit, VectorStore
 
 NOT_FOUND = "I couldn't find this in the uploaded documents."
@@ -85,24 +86,57 @@ def attach_citations(text: str, hits: list[Hit]) -> tuple[str, list[Citation]]:
     return cleaned, [_to_citation(n, hits[n - 1]) for n in used]
 
 
+REFUSED = "The model declined to answer this question."
+
+
 class RAGPipeline:
     def __init__(self, store: VectorStore, llm: LLM):
         self.store = store
         self.llm = llm
 
-    def ask(self, question: str, k: int | None = None) -> Answer:
+    def _retrieve(self, question: str, k: int | None) -> tuple[list[Hit], list[Citation]]:
         hits = self.store.search(question, k or settings.top_k)
-        retrieved = [_to_citation(i, h) for i, h in enumerate(hits, start=1)]
-        if not hits:
-            return Answer(NOT_FOUND, [], [], self.llm.name)
+        return hits, [_to_citation(i, h) for i, h in enumerate(hits, start=1)]
 
-        completion = self.llm.complete(SYSTEM_PROMPT, build_user_message(question, hits))
+    def _finalize(self, completion: Completion, hits: list[Hit], retrieved: list[Citation]) -> Answer:
         if completion.refused:
-            return Answer("The model declined to answer this question.", [], retrieved, self.llm.name)
-
+            return Answer(REFUSED, [], retrieved, self.llm.name)
         model = completion.model or self.llm.name
         text, citations = attach_citations(completion.text, hits)
         if not citations and NOT_FOUND not in text:
             # Ungrounded answer with no valid source tags: don't show it as fact.
             text = NOT_FOUND
         return Answer(text, citations, retrieved, model)
+
+    def ask(self, question: str, k: int | None = None) -> Answer:
+        hits, retrieved = self._retrieve(question, k)
+        if not hits:
+            return Answer(NOT_FOUND, [], [], self.llm.name)
+        completion = self.llm.complete(SYSTEM_PROMPT, build_user_message(question, hits))
+        return self._finalize(completion, hits, retrieved)
+
+    def ask_stream(self, question: str, k: int | None = None) -> Iterator[tuple[str, dict]]:
+        """Yield (event, data) pairs:
+        - ("sources", {"retrieved": [...]}) once retrieval is done
+        - ("thinking", {"text": "..."}) for each piece of model reasoning, if any
+        - ("token", {"text": "..."}) for each piece of raw answer text
+        - ("done", <same shape as ask()>) with the validated answer and citations
+
+        The tokens are the model's raw text. The "done" answer has been through
+        the same citation checks as ask(), so clients should replace the
+        streamed text with it."""
+        hits, retrieved = self._retrieve(question, k)
+        yield "sources", {"retrieved": [asdict(c) for c in retrieved]}
+        if not hits:
+            yield "done", Answer(NOT_FOUND, [], [], self.llm.name).to_dict()
+            return
+
+        completion = Completion("")
+        for item in self.llm.stream(SYSTEM_PROMPT, build_user_message(question, hits)):
+            if isinstance(item, Completion):
+                completion = item
+            elif isinstance(item, Thinking):
+                yield "thinking", {"text": item.text}
+            else:
+                yield "token", {"text": item}
+        yield "done", self._finalize(completion, hits, retrieved).to_dict()

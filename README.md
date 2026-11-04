@@ -52,8 +52,32 @@ through them. Each answer reports which model produced it in its `model` field.
 | GET    | `/api/documents`         | List indexed documents                    |
 | DELETE | `/api/documents/{doc_id}`| Remove a document and its vectors         |
 | POST   | `/api/ask`               | `{"question": "...", "top_k": 6}`         |
+| POST   | `/api/ask/stream`        | Same body, answer streamed as Server-Sent Events |
 
 Duplicate uploads are detected by content hash.
+
+### Streaming
+
+The chat page always streams answers through `/api/ask/stream`, which sends
+these events (`/api/ask` still returns the whole answer at once for API use):
+
+| Event     | Data                                                     |
+|-----------|----------------------------------------------------------|
+| `sources` | `{"retrieved": [...]}` once retrieval is done            |
+| `thinking`| `{"text": "..."}` for each piece of model reasoning, if the model reasons |
+| `token`   | `{"text": "..."}` for each piece of the model's raw text |
+| `done`    | Same JSON as `/api/ask`, after the citation checks       |
+| `error`   | `{"status": 502, "detail": "..."}` if the LLM fails mid-stream |
+
+Tokens are the model's raw output. Citation checks (dropping unknown `[S#]`
+tags, replacing uncited answers with "I couldn't find this…") need the full
+answer, so they run at the end, and clients should replace the streamed text
+with the `done` answer.
+
+Many free OpenRouter models are reasoning models: they think for several
+seconds, then send the answer in a quick burst. The page shows the reasoning
+live in a collapsible "Thinking…" box and types the answer out smoothly so it
+reads as streaming either way.
 
 ## Configuration
 
